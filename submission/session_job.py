@@ -193,7 +193,6 @@ by_session = (
             col("ip"),
             col("user_id"),
             col("window.start"),
-            col("window.end"),
         )
         .cast("string")
         .alias("session_id"),
