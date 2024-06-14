@@ -3,7 +3,7 @@ import sys
 import requests
 import json
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, lit, window, from_json, udf, to_date, hash
+from pyspark.sql.functions import col, from_json, udf, to_date, hash, session_window
 from pyspark.sql.types import (
     StringType,
     IntegerType,
@@ -120,20 +120,21 @@ schema = StructType(
 
 spark.sql(f"""
 CREATE TABLE IF NOT EXISTS {output_table} (
-  session_id VARCHAR(100),
-  user_id VARCHAR(100),
-  session_start TIMESTAMP, 
-  session_end TIMESTAMP,
-  event_count BIGINT, 
-  session_date DATE,
-  city VARCHAR(100),
-  state VARCHAR(100),
-  country VARCHAR(100),
-  operating_system VARCHAR(100),
-  browser VARCHAR(100),
-  logged_in BOOLEAN
+  session_id VARCHAR(100), -- unique id of the session
+  user_id VARCHAR(100), -- user_id if the user was logged in, NULL otherwise
+  session_start TIMESTAMP, -- when the session started
+  session_end TIMESTAMP, -- when the session expired (after 5 minutes of inactivity)
+  event_count BIGINT, -- number of events that occurred during the session
+  session_date DATE, -- date of the session. this is used for partitioning
+  city VARCHAR(100), -- city user is in
+  state VARCHAR(100), -- state user is in
+  country VARCHAR(100), -- country user is in
+  operating_system VARCHAR(100), -- what operating system the user is using
+  browser_family VARCHAR(100), -- what browser the user is using 
+  logged_in BOOLEAN -- true if user is logged in, false otherwise
 )
 USING ICEBERG
+PARTITIONED BY (session_date)
 """)
 
 # Read from Kafka in batch mode
@@ -178,11 +179,17 @@ tumbling_window_df = (
 
 by_session = (
     tumbling_window_df.groupBy(
-        window(col("timestamp"), "5 minutes"),
+        session_window(
+            col("event_time"), "5 minutes"
+        ),  # using 5 minute window based on prompt
         col("value.ip").alias("ip"),
         col("value.user_id").alias("user_id"),
-        col("value.user_agent.family").alias("browser"),
-        col("value.user_agent.os.family").alias("operating_system"),
+        col("value.user_agent.family").alias(
+            "browser_family"
+        ),  # user agent -> family is browser name
+        col("value.user_agent.os.family").alias(
+            "operating_system"
+        ),  # useragent -> os -> family is operating system
         col("geodata.country").alias("country"),
         col("geodata.city").alias("city"),
         col("geodata.state").alias("state"),
@@ -193,11 +200,13 @@ by_session = (
             col("ip"),
             col("user_id"),
             col("window.start"),
-        )
+        )  # hashing these for the session_id because they will identify a unique user including when someone goes from logged out to logged in
         .cast("string")
         .alias("session_id"),
         col("user_id"),
-        col("window.start").alias("session_start"),
+        col("window.start").alias(
+            "session_start"
+        ),  # start of the window is the start of the session
         col("window.end").alias("session_end"),
         col("count").alias("event_count"),
         col("window.start").cast("date").alias("session_date"),
@@ -205,8 +214,10 @@ by_session = (
         col("state"),
         col("country"),
         col("operating_system"),
-        col("browser"),
-        col("user_id").isNotNull().alias("logged_in"),
+        col("browser_family"),
+        col("user_id")
+        .isNotNull()
+        .alias("logged_in"),  # if user_id is null the user is not logged in
     )
 )
 
