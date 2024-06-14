@@ -3,7 +3,15 @@ import sys
 import requests
 import json
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, lit, window, from_json, udf, to_date, hash
+from pyspark.sql.functions import (
+    col,
+    lit,
+    session_window,
+    from_json,
+    udf,
+    to_date,
+    hash,
+)
 from pyspark.sql.types import (
     StringType,
     IntegerType,
@@ -122,18 +130,19 @@ spark.sql(f"""
 CREATE TABLE IF NOT EXISTS {output_table} (
   session_id VARCHAR(100),
   user_id VARCHAR(100),
-  session_start TIMESTAMP, 
+  session_start TIMESTAMP,
   session_end TIMESTAMP,
-  event_count BIGINT, 
+  event_count INTEGER,
   session_date DATE,
   city VARCHAR(100),
   state VARCHAR(100),
   country VARCHAR(100),
   operating_system VARCHAR(100),
-  browser VARCHAR(100),
+  browser_family VARCHAR(100),
   logged_in BOOLEAN
 )
 USING ICEBERG
+PARTITIONED BY (session_date)
 """)
 
 # Read from Kafka in batch mode
@@ -173,15 +182,19 @@ tumbling_window_df = (
     kafka_df.withColumn("decoded_value", decode_udf(col("value")))
     .withColumn("value", from_json(col("decoded_value"), schema))
     .withColumn("geodata", geocode_udf(col("value.ip")))
-    .withWatermark("timestamp", "5 minutes")
+    .withWatermark(
+        "timestamp", "1 minute"
+    )  # setting this to one minute, could be higher
 )
 
 by_session = (
     tumbling_window_df.groupBy(
-        window(col("timestamp"), "5 minutes"),
+        session_window(
+            col("timestamp"), "5 minutes"
+        ),  # setting timeout to 5 minutes based on the spec
         col("value.ip").alias("ip"),
         col("value.user_id").alias("user_id"),
-        col("value.user_agent.family").alias("browser"),
+        col("value.user_agent.family").alias("browser_family"),
         col("value.user_agent.os.family").alias("operating_system"),
         col("geodata.country").alias("country"),
         col("geodata.city").alias("city"),
@@ -192,21 +205,27 @@ by_session = (
         hash(
             col("ip"),
             col("user_id"),
-            col("window.start"),
-        )
+            col("session_window.start"),
+        )  # using these as the hash because these three columns should always be unique
         .cast("string")
         .alias("session_id"),
         col("user_id"),
-        col("window.start").alias("session_start"),
-        col("window.end").alias("session_end"),
+        col("session_window.start").alias("session_start"),
+        col("session_window.end").alias("session_end"),
         col("count").alias("event_count"),
-        col("window.start").cast("date").alias("session_date"),
+        col("session_window.start")
+        .cast("date")
+        .alias(
+            "session_date"
+        ),  # using the start_date instead of the end_date. in reality it probably doesn't matter but I consider the start_date to be the date of the session
         col("city"),
         col("state"),
         col("country"),
         col("operating_system"),
-        col("browser"),
-        col("user_id").isNotNull().alias("logged_in"),
+        col("browser_family"),
+        col("user_id")
+        .isNotNull()
+        .alias("logged_in"),  # true if user_id is not null, false otherwise
     )
 )
 
